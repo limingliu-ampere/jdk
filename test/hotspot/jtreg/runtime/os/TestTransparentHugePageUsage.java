@@ -25,10 +25,10 @@
  * @test TestTransparentHugePageUsage
  * @bug 8315923
  * @library /test/lib
- * @requires vm.gc.Serial & os.family == "linux" & os.maxMemory > 2G
+ * @requires vm.gc.Parallel & os.family == "linux" & os.maxMemory > 2G
  * @summary Check that a pretouched java heap appears to use THPs by checking
  *          AnonHugePages in smaps
- * @comment Use SerialGC to increase the time window for pretouching
+ * @comment Use ParallelGC to pretouch the heap all together
  * @run driver runtime.os.TestTransparentHugePageUsage
  */
 
@@ -37,6 +37,7 @@ package runtime.os;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.InputStreamReader;
+import java.io.StringBufferInputStream;
 import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -48,8 +49,9 @@ import jdk.test.lib.process.ProcessTools;
 public class TestTransparentHugePageUsage {
   private static final String[] fixedCmdLine = {
     "-XX:+UseTransparentHugePages", "-XX:+AlwaysPreTouch",
-    "-Xlog:startuptime,pagesize,gc+heap=debug",
-    "-XX:+UseSerialGC", "-Xms1G", "-Xmx1G",
+    "-Xlog:startuptime,pagesize,gc+os=debug",
+    "-XX:+UseParallelGC", "-XX:ParallelGCThreads=1",
+    "-Xms1G", "-Xmx1G", "-Xmn512M", "-XX:PreTouchParallelChunkSize=512M",
   };
 
   public static void main(String[] args) throws Exception {
@@ -59,39 +61,54 @@ public class TestTransparentHugePageUsage {
     checkUsage(new BufferedReader(new InputStreamReader(builder.start().getInputStream())));
   }
 
-  private static void checkUsage(BufferedReader reader) throws Exception {
-    final Pattern useThp = Pattern.compile(".*\\[info\\]\\[pagesize\\].+UseTransparentHugePages=1.*");
-    // Ensure THP is not disabled by OS.
-    if (reader.lines().filter(line -> useThp.matcher(line).matches()).findFirst().isPresent()) {
+  private static void checkUsage(BufferedReader oReader) throws Exception {
+    final Pattern useThp = Pattern.compile(".*\\[info\\s*\\]\\[pagesize\\s*\\].+UseTransparentHugePages=1.*");
+    final Pattern useMadv = Pattern.compile(".*\\[debug\\s*\\]\\[gc,os\\s*\\].+UseMadvPopulateWrite=1.*");
+    final String content = oReader.lines().reduce("", (str, line) -> str += line + '\n');
+    final BufferedReader reader = new BufferedReader(new InputStreamReader(new StringBufferInputStream(content)));
+    // Ensure THP is not disabled by OS and MADV_POPULATE_WRITE is supported.
+    if (reader.lines().filter(line -> useThp.matcher(line).matches()).findFirst().isPresent() &&
+        reader.lines().filter(line -> useMadv.matcher(line).matches()).findFirst().isPresent()) {
       final Pattern heapAddr = Pattern.compile(".*\\sHeap:\\s.+base=0x0*(\\p{XDigit}+).*");
       final Optional<Long> addr = reader.lines()
           .map(line -> new SimpleEntry<String, Matcher>(line, heapAddr.matcher(line)))
           .filter(e -> e.getValue().matches())
           .findFirst()
-          .map(e -> Long.valueOf(e.getKey().substring(e.getValue().start(1), e.getValue().end(1)), 16));
+          .map(e -> Long.parseUnsignedLong(e.getKey().substring(e.getValue().start(1), e.getValue().end(1)), 16));
       if (!addr.isPresent()) throw new RuntimeException("Heap base was not found in smaps.");
       // Match the start of a mapping, for example:
       // 200000000-800000000 rw-p 00000000 00:00 0
       final Pattern mapping = Pattern.compile("^(\\p{XDigit}+)-\\p{XDigit}+.*");
-      reader.lines()
-            .filter(line -> {
-                  Matcher matcher = mapping.matcher(line);
-                  if (matcher.matches()) {
-                    Long mappingAddr = Long.valueOf(line.substring(matcher.start(1), matcher.end(1)), 16);
-                    if (mappingAddr.equals(addr.get())) return true;
-                  }
-                  return false;
-                })
-            .findFirst();
-      final Pattern thpUsage = Pattern.compile("^AnonHugePages:\\s+(\\d+)\\skB");
-      final Optional<Long> usage = reader.lines()
-          .map(line -> new SimpleEntry<String, Matcher>(line, thpUsage.matcher(line)))
-          .filter(e -> e.getValue().matches())
-          .findFirst()
-          .map(e -> Long.valueOf(e.getKey().substring(e.getValue().start(1), e.getValue().end(1))));
-      if (!usage.isPresent()) throw new RuntimeException("The usage of THP was not found.");
+      final Long GB = 1L * 1024 * 1024 * 1024;
+      Long sum = 0L;
+      while (true) {
+        reader.lines()
+              .filter(line -> {
+                    Matcher matcher = mapping.matcher(line);
+                    if (matcher.matches()) {
+                      Long mappingAddr = Long.parseUnsignedLong(line.substring(matcher.start(1), matcher.end(1)), 16);
+                      if (Long.compareUnsigned(addr.get(), mappingAddr) <= 0 &&
+                          Long.compareUnsigned(mappingAddr, (addr.get() + 1 * GB)) < 0) {
+                        return true;
+                      }
+                    }
+                    return false;
+                  })
+              .findFirst();
+        if (!reader.lines().findAny().isPresent()) break;
+        final Pattern thpUsage = Pattern.compile("^AnonHugePages:\\s+(\\d+)\\skB");
+        final Optional<Long> usage = reader.lines()
+            .map(line -> new SimpleEntry<String, Matcher>(line, thpUsage.matcher(line)))
+            .filter(e -> e.getValue().matches())
+            .findFirst()
+            .map(e -> Long.valueOf(e.getKey().substring(e.getValue().start(1), e.getValue().end(1))));
+        if (usage.isPresent()) sum += usage.get();
+      }
+      System.out.print(content);
       // Even with MADV_POPULATE_WRITE, the usage of THP is still one page less than the whole heap.
-      if (usage.get() < 524288) throw new RuntimeException("The usage of THP is not enough.");
+      if (sum < 524288) {
+        throw new RuntimeException("The usage of THP is not enough.");
+      }
     }
   }
 

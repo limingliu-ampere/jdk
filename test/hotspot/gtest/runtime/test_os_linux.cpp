@@ -25,6 +25,7 @@
 
 #ifdef LINUX
 
+#include "hugepages.hpp"
 #include "os_linux.hpp"
 #include "prims/jniCheck.hpp"
 #include "runtime/globals.hpp"
@@ -350,16 +351,52 @@ TEST_VM(os_linux, reserve_memory_special_concurrent) {
   }
 }
 
-TEST_VM(os_linux, pretouch_thp_and_use_concurrent) {
-  // Explicitly enable thp to test cocurrent system calls.
-  const size_t size = 1 * G;
-  const bool useThp = UseTransparentHugePages;
-  UseTransparentHugePages = true;
-  char* const heap = os::reserve_memory(size, false, mtInternal);
-  EXPECT_NE(heap, nullptr);
-  EXPECT_TRUE(os::commit_memory(heap, size, false));
+class PretouchThpTests: os::Linux {
+  static void test_init() {
+    // MADV_POPULATE_WRITE
+    const int flag = 23 + (_is_uek_release ? 1 : 0);
+    UseMadvPopulateWrite = (::madvise(0, 0, flag) == 0);
+    UseTransparentHugePages = true;
+  }
 
-  {
+public:
+  static void run(std::function<void(char *const, size_t)> theTest) {
+    const size_t size = 1 * G;
+    const bool useThp = UseTransparentHugePages, usePop = UseMadvPopulateWrite;
+    test_init();
+    char* const heap = os::reserve_memory(size, false, mtInternal);
+    EXPECT_NE(heap, nullptr);
+    EXPECT_TRUE(os::commit_memory(heap, size, false));
+    os::realign_memory(heap, size, HugePages::thp_pagesize());
+    theTest(heap, size);
+    EXPECT_TRUE(os::uncommit_memory(heap, size, false));
+    EXPECT_TRUE(os::release_memory(heap, size));
+    UseTransparentHugePages = useThp;
+    UseMadvPopulateWrite = usePop;
+  }
+
+  static void read_thp_alloc(long* thp_fault_alloc, long* thp_fault_fallback) {
+    if (FILE *vmstat = os::fopen("/proc/vmstat", "r")) {
+      char line[81];
+      while (fgets(line, 81, vmstat)) {
+	if (strncmp(line, "thp_", 4) == 0) fprintf(stderr, "%s", line);
+	if (*thp_fault_alloc == -1) {
+	  sscanf(line, "thp_fault_alloc %ld", thp_fault_alloc);
+	} else if (*thp_fault_fallback == -1) {
+	  sscanf(line, "thp_fault_fallback %ld", thp_fault_fallback);
+	}
+	//  else {
+	//   break;
+	// }
+
+      }
+      fclose(vmstat);
+    }
+  }
+};
+
+TEST_VM(os_linux, pretouch_thp_and_use_concurrent) {
+  auto theTest = [](char* const heap, size_t size){
     auto pretouch = [heap, size](Thread*, int) {
       os::pretouch_memory(heap, heap + size, os::vm_page_size());
     };
@@ -373,15 +410,36 @@ TEST_VM(os_linux, pretouch_thp_and_use_concurrent) {
     pretouchThreads.doit();
     useMemoryThreads.join();
     pretouchThreads.join();
-  }
 
-  int* iptr = reinterpret_cast<int*>(heap);
-  for (int i = 0; i < 1000; i++)
-    EXPECT_EQ(*iptr++, i);
+    int* iptr = reinterpret_cast<int*>(heap);
+    for (int i = 0; i < 1000; i++)
+      EXPECT_EQ(*iptr++, i);
+  };
 
-  EXPECT_TRUE(os::uncommit_memory(heap, size, false));
-  EXPECT_TRUE(os::release_memory(heap, size));
-  UseTransparentHugePages = useThp;
+  PretouchThpTests::run(theTest);
+}
+
+TEST_VM(os_linux, pretouch_thp_fault_alloc) {
+  auto theTest = [](char* const heap, size_t size) {
+    if (!UseMadvPopulateWrite) return;
+    long thp_fault_alloc_before = -1, thp_fault_fallback_before = -1;
+    fprintf(stderr, "Reading thp counters before pretouch:\n");
+    PretouchThpTests::read_thp_alloc(&thp_fault_alloc_before, &thp_fault_fallback_before);
+    fflush(stderr);
+    if (thp_fault_alloc_before == -1 || thp_fault_fallback_before == -1) return;
+    os::pretouch_memory(heap, heap + size, os::vm_page_size());
+    long thp_fault_alloc_after = -1, thp_fault_fallback_after = -1;
+    fprintf(stderr, "Reading thp counters after pretouch:\n");
+    PretouchThpTests::read_thp_alloc(&thp_fault_alloc_after, &thp_fault_fallback_after);
+    fflush(stderr);
+    if (thp_fault_alloc_after == -1 || thp_fault_fallback_after == -1) return;
+    const long delta = (thp_fault_alloc_after - thp_fault_alloc_before) +
+      (thp_fault_fallback_after - thp_fault_fallback_before),
+      supposed = HugePages::thp_pagesize() == 0 ? 1 : size / HugePages::thp_pagesize() / 2;
+    EXPECT_GE(delta, supposed);
+  };
+
+  PretouchThpTests::run(theTest);
 }
 
 // Check that method JNI_CreateJavaVM is found.
